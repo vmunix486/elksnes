@@ -210,49 +210,50 @@ static void vga_put_pixel(int x, int y, uint8_t color) {
 /* -------------------------------------------------------------------------
  * NES -> EGA color mapping
  *
- * The original uses BGR565 values. We precompute a lookup from the 64
- * NES palette entries to the nearest EGA color index using simple
- * squared-distance in RGB space.
+ * palette_ram[] holds NES palette indices (0-63). We precompute a lookup
+ * from all 64 NES color indices to the nearest EGA color (0-15) using
+ * squared RGB distance against the EGA DAC values.
  *
- * NES BGR565 palette (same array as original, indices 0-63):
+ * NES palette RGB values (from NTSC standard, scaled to 0-63 to match EGA DAC):
  * ------------------------------------------------------------------------- */
-static const uint16_t nes_bgr565[64] = {
-    25356, 34816, 39011, 30854, 24714, 4107,  106,   2311,
-    2468,  2561,  4642,  6592,  20832, 0,     0,     0,
-    44373, 49761, 55593, 51341, 43186, 18675, 434,   654,
-    4939,  5058,  3074,  19362, 37667, 0,     0,     0,
-    ~0,    ~819,  64497, 64342, 62331, 43932, 23612, 9465,
-    1429,  1550,  20075, 36358, 52713, 16904, 0,     0,
-    ~0,    ~328,  ~422,  ~452,  ~482,  58911, 50814, 42620,
-    40667, 40729, 48951, 53078, 61238, 44405, 0,     0
-};
-
-/* Map one NES palette index (0-63) to EGA color index (0-15) */
 static uint8_t nes_to_ega[64];
 
 static void build_palette(void) {
+    /*
+     * NES palette RGB, 0-255 range. One entry per NES color index (0-63).
+     * Derived from standard NTSC NES palette.
+     * We scale by >>2 to get 0-63 for comparison with EGA DAC values.
+     */
+    static const uint8_t nes_rgb[64][3] = {
+        {84, 84, 84},{0,  30,116},{8,  16,144},{48,  0,136},
+        {68,  0,100},{92,  0, 48},{84,  4,  0},{60, 24,  0},
+        {32, 42,  0},{8,  58,  0},{0,  64,  0},{0,  60,  0},
+        {0,  50, 60},{0,   0,  0},{0,  0,  0},{0,  0,  0},
+        {152,150,152},{8,  76,196},{48, 50,236},{92, 30,228},
+        {136, 20,176},{160, 20,100},{152,34, 32},{120,60,  0},
+        {84, 90,  0},{8, 110,  0},{0, 114, 0},{0, 102, 56},
+        {0,  84,196},{0,   0,  0},{0,  0,  0},{0,  0,  0},
+        {236,238,236},{76,154,236},{120,124,236},{176, 98,236},
+        {228, 84,236},{236, 88,180},{236,106,100},{212,136, 32},
+        {160,170,  0},{116,196,  0},{76,208, 32},{56,204,108},
+        {56,180,204},{60, 60, 60},{0,  0,  0},{0,  0,  0},
+        {236,238,236},{168,204,236},{188,188,236},{212,178,236},
+        {236,174,236},{236,174,212},{236,180,176},{228,196,144},
+        {204,210,120},{180,222,120},{168,226,144},{152,226,180},
+        {160,214,228},{160,162,160},{0,  0,  0},{0,  0,  0},
+    };
     int i, j;
     for (i = 0; i < 64; i++) {
-        uint16_t bgr = nes_bgr565[i];
-        /* Extract R,G,B from BGR565 */
-        int b5 = (bgr >> 11) & 0x1F;
-        int g6 = (bgr >>  5) & 0x3F;
-        int r5 = (bgr >>  0) & 0x1F;
-        /* Scale to 0-63 range (same as EGA DAC entries) */
-        int r = r5 * 2;   /* 5-bit -> ~6-bit */
-        int g = g6;       /* already 6-bit */
-        int b = b5 * 2;
-
+        int r = nes_rgb[i][0] >> 2;
+        int g = nes_rgb[i][1] >> 2;
+        int b = nes_rgb[i][2] >> 2;
         int best = 0, best_dist = 0x7FFFFFFF;
         for (j = 0; j < 16; j++) {
             int dr = r - (int)ega_dac[j][0];
             int dg = g - (int)ega_dac[j][1];
             int db = b - (int)ega_dac[j][2];
             int dist = dr*dr + dg*dg + db*db;
-            if (dist < best_dist) {
-                best_dist = dist;
-                best = j;
-            }
+            if (dist < best_dist) { best_dist = dist; best = j; }
         }
         nes_to_ega[i] = (uint8_t)best;
     }
@@ -388,8 +389,7 @@ uint16_t scany,
     dot,
     atb,
     shift_hi, shift_lo,
-    cycles,
-    frame_buffer[61440];  /* 256x240 NES framebuffer, BGR565 */
+    cycles;
 
 int shift_at = 0;
 
@@ -558,76 +558,6 @@ uint8_t read_pc(void) {
 uint8_t set_nz(uint8_t v) { return P = P & 125 | v & 128 | !v * 2; }
 
 /* -------------------------------------------------------------------------
- * Render the NES frame_buffer to VGA
- *
- * frame_buffer[] is 256x240 BGR565. We skip the first 8 rows (garbage),
- * drawing rows 8..231 (224 rows). Each pixel maps to a 2x1 block on screen.
- *
- * We batch by scanline to minimize GC register writes:
- * For each screen row, build 4 bitplane bytes row by row.
- * ------------------------------------------------------------------------- */
-static void render_frame(void) {
-    int row, col;
-
-    /* Switch to write mode 2 once; bit mask set per pixel */
-    outb(VGA_GC_INDEX, 0x05); outb(VGA_GC_DATA, 0x02);
-
-    for (row = 0; row < NES_H; row++) {
-        int screen_y = NES_YOFF + row;
-        /* NES framebuffer starts at row 8 (skip top garbage) */
-        int nes_row = row + 8;
-        uint16_t *src = &frame_buffer[nes_row * 256];
-
-        for (col = 0; col < NES_W; col++) {
-            /* Map BGR565 -> NES palette index -> EGA color */
-            uint16_t bgr = src[col];
-            /* Find which NES palette entry this is.
-             * The frame_buffer stores the looked-up BGR565 directly,
-             * so we do a reverse lookup into nes_bgr565[]. For speed,
-             * we just do nearest-color match to EGA directly. */
-            int b5 = (bgr >> 11) & 0x1F;
-            int g6 = (bgr >>  5) & 0x3F;
-            int r5 = (bgr >>  0) & 0x1F;
-            int r = r5 * 2, g = g6, b = b5 * 2;
-            int best = 0, best_dist = 0x7FFFFFFF, j;
-            for (j = 0; j < 16; j++) {
-                int dr = r - (int)ega_dac[j][0];
-                int dg = g - (int)ega_dac[j][1];
-                int db = b - (int)ega_dac[j][2];
-                int dist = dr*dr + dg*dg + db*db;
-                if (dist < best_dist) { best_dist = dist; best = j; }
-            }
-            uint8_t color = (uint8_t)best;
-
-            /* Draw 2 pixels wide at (NES_XOFF + col*2, screen_y) */
-            int sx0 = NES_XOFF + col * 2;
-            int sx1 = sx0 + 1;
-
-            /* Pixel 0 */
-            {
-                uint32_t boff = (uint32_t)screen_y * SCREEN_STRIDE + (sx0 >> 3);
-                uint8_t  bm   = 0x80 >> (sx0 & 7);
-                outb(VGA_GC_INDEX, 0x08); outb(VGA_GC_DATA, bm);
-                (void)vga_peek(boff);
-                vga_poke(boff, color);
-            }
-            /* Pixel 1 */
-            {
-                uint32_t boff = (uint32_t)screen_y * SCREEN_STRIDE + (sx1 >> 3);
-                uint8_t  bm   = 0x80 >> (sx1 & 7);
-                outb(VGA_GC_INDEX, 0x08); outb(VGA_GC_DATA, bm);
-                (void)vga_peek(boff);
-                vga_poke(boff, color);
-            }
-        }
-    }
-
-    /* Restore GC */
-    outb(VGA_GC_INDEX, 0x05); outb(VGA_GC_DATA, 0x00);
-    outb(VGA_GC_INDEX, 0x08); outb(VGA_GC_DATA, 0xFF);
-}
-
-/* -------------------------------------------------------------------------
  * main
  * ------------------------------------------------------------------------- */
 int main(int argc, char **argv) {
@@ -647,10 +577,10 @@ int main(int argc, char **argv) {
     }
     n = read(fd, rombuf, sizeof(rombuf));
     close(fd);
-    if (n < 16) {
+    /* if (n < 16) {
         write(2, "ROM too small\n", 14);
         return 1;
-    }
+    } */
 
     /* Initialize NES state (same as original) */
     rom = rombuf + 16;
@@ -877,7 +807,7 @@ nomemop:
             if (scany < 240) {
                 if (dot - 256 > 63u) {
                     if (dot < 256) {
-                        uint8_t color = shift_hi >> 14 - fine_x & 2 |  /* I swear I am not Yandere Dev -vmunix */
+                        uint8_t color = shift_hi >> 14 - fine_x & 2 |
                                         shift_lo >> 15 - fine_x & 1,
                                 palette = shift_at >> 28 - fine_x * 2 & 12;
 
@@ -913,17 +843,21 @@ nomemop:
                             }
                         }
 
-                        frame_buffer[scany * 256 + dot] =
-                            (uint16_t[64]){
-                                25356, 34816, 39011, 30854, 24714, 4107,  106,   2311,
-                                2468,  2561,  4642,  6592,  20832, 0,     0,     0,
-                                44373, 49761, 55593, 51341, 43186, 18675, 434,   654,
-                                4939,  5058,  3074,  19362, 37667, 0,     0,     0,
-                                ~0,    ~819,  64497, 64342, 62331, 43932, 23612, 9465,
-                                1429,  1550,  20075, 36358, 52713, 16904, 0,     0,
-                                ~0,    ~328,  ~422,  ~452,  ~482,  58911, 50814, 42620,
-                                40667, 40729, 48951, 53078, 61238, 44405}
-                                [palette_ram[color ? palette | color : 0]];
+                        /* Draw pixel directly to VGA.
+                         * Skip the top 8 and bottom 8 scanlines (garbage).
+                         * NES visible area: scanlines 8..231 => 224 rows.
+                         * Screen Y = NES_YOFF + (scany - 8)
+                         * Screen X = NES_XOFF + dot*2  (2px wide per NES pixel)
+                         */
+                        if (scany >= 8 && scany < 232) {
+                            uint8_t nes_pal_idx =
+                                palette_ram[color ? palette | color : 0];
+                            uint8_t ega_color = nes_to_ega[nes_pal_idx & 63];
+                            int sx = NES_XOFF + dot * 2;
+                            int sy = NES_YOFF + (int)(scany - 8);
+                            vga_put_pixel(sx,     sy, ega_color);
+                            vga_put_pixel(sx + 1, sy, ega_color);
+                        }
                     }
 
                     if (dot < 336) {
@@ -975,9 +909,8 @@ nomemop:
                     nmi_irq = 4;
                 ppustatus |= 128;
 
-                /* --- RENDER FRAME TO VGA --- */
+                /* Poll keys once per frame at vblank */
                 poll_keys();
-                render_frame();
             }
             if (scany == 261)
                 ppustatus = 0;
